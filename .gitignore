@@ -1,2 +1,6 @@
-.idea/
-.DS_Store
+.direnv/
+zig-out/
+.zig-cache/
+zig-pkg/
+result
+result-*

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # TR-100 Machine Report
 # Copyright © 2024, U.S. Graphics, LLC. BSD-3-Clause License.
 
@@ -299,7 +299,21 @@ else
 fi
 
 # Last login and Uptime
-last_login=$(lastlog -u "$USER")
+# NixOS: util-linux >= 2.42 dropped legacy lastlog(8); its replacement lastlog2 reads a
+# sqlite database this system does not populate. Read the legacy /var/log/lastlog directly
+# instead: 296-byte records indexed by uid — time_t ll_time (8) + char ll_line[32] +
+# char ll_host[256] — and emit the same two-line output legacy lastlog produced, so the
+# parsing below is unchanged.
+ll_uid=$(id -u "$USER")
+ll_time=$(dd if=/var/log/lastlog bs=1 skip=$((296*ll_uid)) count=8 2>/dev/null | od -A n -t u8 | tr -d ' ')
+ll_line=$(dd if=/var/log/lastlog bs=1 skip=$((296*ll_uid+8)) count=32 2>/dev/null | tr -d '\0')
+ll_host=$(dd if=/var/log/lastlog bs=1 skip=$((296*ll_uid+40)) count=256 2>/dev/null | tr -d '\0')
+if [ -n "$ll_time" ] && [ "$ll_time" -ne 0 ]; then
+    ll_latest=$(date -d "@$ll_time" '+%a %b %e %H:%M:%S %z %Y')
+else
+    ll_latest='**Never logged in**'
+fi
+last_login=$(printf 'Username Port From Latest\n%s %s %s %s\n' "$USER" "$ll_line" "$ll_host" "$ll_latest")
 last_login_ip=$(echo "$last_login" | awk 'NR==2 {print $3}')
 
 # Check if last_login_ip is an IP address

@@ -1,0 +1,12 @@
+.{
+    .name = .usgc_machine_report,
+    .version = "0.0.0",
+    .fingerprint = 0xfafc3850ba1facc1, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -52,16 +52,6 @@ const recv_buf_len = 4096;
 
 const stdout_buffer_len = 16 * 1024;
 
-/// A field from a fixed NUL-terminated kernel struct ([64:0]u8 and friends).
-fn cstr(field: []const u8) []const u8 {
-    return field[0 .. mem.findScalar(u8, field, 0) orelse field.len];
-}
-
-test "cstr" {
-    try testing.expectEqualStrings("pts/1", cstr("pts/1\x00\x00"));
-    try testing.expectEqualStrings("abc", cstr("abc"));
-}
-
 /// Whitespace-run tokenizer with awk field semantics: fields are 1-based,
 /// runs of blanks collapse, out-of-range fields read as empty.
 const Fields = struct {
@@ -102,7 +92,7 @@ const Fields = struct {
 };
 
 test "Fields awk semantics" {
-    const f = Fields.parse("matt pts/1 45.26.44.184 Sat Sep 26 12:06:18 -0700 2026");
+    const f: Fields = .parse("matt pts/1 45.26.44.184 Sat Sep 26 12:06:18 -0700 2026");
     try testing.expectEqualStrings("matt", f.at(1));
     try testing.expectEqualStrings("45.26.44.184", f.at(3));
     try testing.expectEqualStrings("", f.at(10));
@@ -115,7 +105,7 @@ test "Fields awk semantics" {
 }
 
 test "Fields never-logged row" {
-    const f = Fields.parse("matt    **Never logged in**");
+    const f: Fields = .parse("matt    **Never logged in**");
     var buf: [64]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try f.join(&w, &.{ 4, 5, 8, 6 });
@@ -802,7 +792,7 @@ const Tz = struct {
     transitions: [max_transitions]i64 = undefined,
     type_indices: [max_transitions]u8 = undefined,
     utoffs: [max_types]i32 = undefined,
-    is_dst: [max_types]bool = undefined,
+    is_dst: std.StaticBitSet(max_types) = .initEmpty(),
     n_transitions: u16 = 0,
     n_types: u16 = 0,
 
@@ -856,7 +846,7 @@ const Tz = struct {
         for (0..counts[4]) |i| {
             if (off + 6 > buf.len) return null;
             self.utoffs[i] = mem.readInt(i32, buf[off..][0..4], .big);
-            self.is_dst[i] = buf[off + 4] != 0;
+            self.is_dst.setValue(i, buf[off + 4] != 0);
             off += 6;
         }
         return self;
@@ -874,7 +864,7 @@ const Tz = struct {
         if (lo == 0) {
             var i: usize = 0;
             while (i < self.n_types) : (i += 1) {
-                if (!self.is_dst[i]) return self.utoffs[i];
+                if (!self.is_dst.isSet(i)) return self.utoffs[i];
             }
             return if (self.n_types > 0) self.utoffs[0] else 0;
         }
@@ -981,7 +971,7 @@ test "upperFirst" {
 /// "Linux 7.2.6 " — the trailing space is { uname; uname -r; } | tr '\n' ' '.
 fn gatherKernel(uts: *const posix.utsname, out: *Str(64)) void {
     out.setTrunc("");
-    out.print("{s} {s} ", .{ cstr(&uts.sysname), cstr(&uts.release) });
+    out.print("{s} {s} ", .{ mem.sliceTo(&uts.sysname, 0), mem.sliceTo(&uts.release, 0) });
 }
 
 /// hostname -f, in-process: resolve our own hostname against /etc/hosts
@@ -989,14 +979,14 @@ fn gatherKernel(uts: *const posix.utsname, out: *Str(64)) void {
 /// first name on the matching line; no match leaves "Not Defined".
 fn resolveHostname(uts: *const posix.utsname, hosts: []const u8, out: *Str(128)) void {
     out.set("Not Defined");
-    const hostname = cstr(&uts.nodename);
+    const hostname = mem.sliceTo(&uts.nodename, 0);
     var rest = hosts;
     while (rest.len > 0) {
         const nl = mem.findScalar(u8, rest, '\n') orelse rest.len;
         const line = rest[0..nl];
         rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
         if (line.len == 0 or line[0] == '#') continue;
-        const fields = Fields.parse(line);
+        const fields: Fields = .parse(line);
         if (fields.count < 2) continue;
         // $1 is the address; match against names ($2 canonical, $3+ aliases).
         var i: u8 = 2;
@@ -1044,7 +1034,7 @@ fn gatherDnsServersScan(resolv: []const u8, out: *[max_dns_entries]Str(64), coun
         const nl = mem.findScalar(u8, rest, '\n') orelse rest.len;
         const line = rest[0..nl];
         rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
-        const fields = Fields.parse(line);
+        const fields: Fields = .parse(line);
         if (!mem.eql(u8, fields.at(1), "nameserver")) continue;
         const server = fields.at(2);
         var digits_and_dots = server.len > 0;
@@ -1117,8 +1107,8 @@ fn gatherClientIp(io: Io, out: *Str(256)) void {
         // off advances by whole 400-byte records, so alignment holds.
         const record: *const UtmpRecord = @ptrCast(@alignCast(utmp[off..].ptr));
         if (record.ut_type != ut_user_process) continue;
-        if (!mem.eql(u8, cstr(&record.ut_line), tty_line)) continue;
-        const host = cstr(&record.ut_host);
+        if (!mem.eql(u8, mem.sliceTo(&record.ut_line, 0), tty_line)) continue;
+        const host = mem.sliceTo(&record.ut_host, 0);
         // A local login records an empty host; who am i shows none, so
         // the script's $5 stays empty and renders "Not connected".
         if (host.len == 0) return;
@@ -1133,8 +1123,8 @@ test "UtmpRecord field offsets" {
     record.ut_type = ut_user_process;
     @memcpy(record.ut_line[0.."pts/1".len], "pts/1");
     @memcpy(record.ut_host[0.."45.26.44.184".len], "45.26.44.184");
-    try testing.expectEqualStrings("pts/1", cstr(&record.ut_line));
-    try testing.expectEqualStrings("45.26.44.184", cstr(&record.ut_host));
+    try testing.expectEqualStrings("pts/1", mem.sliceTo(&record.ut_line, 0));
+    try testing.expectEqualStrings("45.26.44.184", mem.sliceTo(&record.ut_host, 0));
 }
 
 // ------------------------------------------------------------------- CPU
@@ -1220,7 +1210,7 @@ test "armModelName" {
 /// — always four slots, so a one-word model gains three trailing spaces
 /// ("Neoverse-V3   " in the fixtures; PRINT_DATA pads them invisible).
 fn writeSquashedFields(w: *Io.Writer, model: []const u8) !void {
-    const fields = Fields.parse(model);
+    const fields: Fields = .parse(model);
     for (1..5) |i| {
         if (i > 1) try w.writeAll(" ");
         try w.writeAll(fields.at(@intCast(i)));
@@ -1334,7 +1324,7 @@ fn gatherCpuHypervisor(io: Io, cpuinfo: []const u8, out: *Str(32)) void {
 
 fn cpuinfoHasHypervisorFlag(cpuinfo: []const u8) bool {
     const flags = findCpuinfoLine("flags", cpuinfo, false) orelse return false;
-    const fields = Fields.parse(flags);
+    const fields: Fields = .parse(flags);
     var i: u8 = 1;
     while (i <= fields.count) : (i += 1) {
         if (mem.eql(u8, fields.at(i), "hypervisor")) return true;
@@ -1536,7 +1526,7 @@ fn gatherMeminfo(io: Io) struct { total_kib: u64, available_kib: u64 } {
         const nl = mem.findScalar(u8, rest, '\n') orelse rest.len;
         const line = rest[0..nl];
         rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
-        const fields = Fields.parse(line);
+        const fields: Fields = .parse(line);
         const value = parseUint(fields.at(2)) orelse continue;
         if (mem.eql(u8, fields.at(1), "MemTotal:")) total = value;
         if (mem.eql(u8, fields.at(1), "MemAvailable:")) available = value;
@@ -1555,7 +1545,7 @@ test "gatherMeminfo core" {
         const nl = mem.findScalar(u8, rest, '\n') orelse rest.len;
         const line = rest[0..nl];
         rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
-        const fields = Fields.parse(line);
+        const fields: Fields = .parse(line);
         const value = parseUint(fields.at(2)) orelse continue;
         if (mem.eql(u8, fields.at(1), "MemTotal:")) total = value;
         if (mem.eql(u8, fields.at(1), "MemAvailable:")) available = value;
@@ -1629,8 +1619,8 @@ fn gatherLastLogin(
             }
             row.print("{s} {s} {s} {s} {s} {d} ", .{
                 user_name,
-                cstr(&record.ll_line),
-                cstr(&record.ll_host),
+                mem.sliceTo(&record.ll_line, 0),
+                mem.sliceTo(&record.ll_host, 0),
                 weekday_names[weekdayFromDays(days)],
                 month_names[date.month - 1],
                 date.day,
@@ -1649,7 +1639,7 @@ fn gatherLastLogin(
         row.print("{s} **Never logged in**", .{user_name});
     }
 
-    const fields = Fields.parse(row.view());
+    const fields: Fields = .parse(row.view());
     var out: LastLogin = .{};
     const host = fields.at(3);
     if (isDottedQuad(host)) {
@@ -1675,8 +1665,8 @@ test "LastLogin record shape" {
     record.ll_time = 1790449578; // the fixture: 2026-09-26 12:06:18 -0700
     @memcpy(record.ll_line[0.."pts/1".len], "pts/1");
     @memcpy(record.ll_host[0.."45.26.44.184".len], "45.26.44.184");
-    try testing.expectEqualStrings("pts/1", cstr(&record.ll_line));
-    try testing.expectEqualStrings("45.26.44.184", cstr(&record.ll_host));
+    try testing.expectEqualStrings("pts/1", mem.sliceTo(&record.ll_line, 0));
+    try testing.expectEqualStrings("45.26.44.184", mem.sliceTo(&record.ll_host, 0));
 }
 
 // ------------------------------------------------------------------ uptime
@@ -1966,7 +1956,7 @@ test "parseHundredths" {
 fn parseLoadAverages(io: Io, report: *Report) void {
     var loadavg_buf: [sysfs_read_max]u8 = undefined;
     const loadavg = readFileOrEmpty(io, "/proc/loadavg", &loadavg_buf);
-    const fields = Fields.parse(loadavg);
+    const fields: Fields = .parse(loadavg);
     report.load_1min_hd = parseHundredths(fields.at(1));
     report.load_5min_hd = parseHundredths(fields.at(2));
     report.load_15min_hd = parseHundredths(fields.at(3));
@@ -2182,7 +2172,7 @@ pub fn main(init: process.Init.Minimal) !void {
 
     const io = threaded.io();
 
-    var report: Report = Report.read(io, init.environ);
+    var report: Report = .read(io, init.environ);
 
     var stdout_buffer: [stdout_buffer_len]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);

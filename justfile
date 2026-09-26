@@ -24,8 +24,9 @@ golden: build
     set -euo pipefail
     bash machine_report.sh > /tmp/tr100_bash.txt 2>/dev/null
     ./zig-out/bin/usgc_machine_report > /tmp/tr100_zig.txt
-    diff /tmp/tr100_bash.txt /tmp/tr100_zig.txt \
-        && echo "raw diff: byte-identical"
+    # Informational: volatile rows (load, memory, disk, uptime) drift
+    # between the two runs; the normalized diff is the actual gate.
+    diff /tmp/tr100_bash.txt /tmp/tr100_zig.txt || true
     diff <(sed 's/[0-9]/N/g' /tmp/tr100_bash.txt) \
          <(sed 's/[0-9]/N/g' /tmp/tr100_zig.txt) \
         && echo "normalized diff: identical"

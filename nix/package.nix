@@ -20,7 +20,7 @@ let
     nativeBuildInputs = [ pkgs.zig_0_16.hook ];
     dontSetZigDefaultFlags = true;
     zigBuildFlags = [
-      "-Doptimize=ReleaseSafe"
+      "-Doptimize=ReleaseFast"
       "-Dcpu=baseline"
       "--system"
       "${dependencies}"
@@ -38,7 +38,7 @@ let
     '';
     meta = {
       description = "TR-100 machine report — fork-free login banner";
-      homepage = "https://github.com/usgraphics/usgc-machine-report";
+      homepage = "https://github.com/mattrobenolt/usgc-machine-report";
       license = lib.licenses.bsd3;
       mainProgram = "usgc_machine_report";
       platforms = [

@@ -6,28 +6,36 @@
 //! with no Io equivalent (statfs, uname, readlinkat, getuid). The report
 //! renders into the stdout writer's buffer and flushes once.
 //!
-//! Row layout, quirks included — trailing spaces, " GHz", over-100% load
-//! bars, awk's field picks with their empty separators — replicates
-//! machine_report.sh byte-for-byte on the hosts it was verified on;
-//! volatile values (load, memory, clock) drift naturally.
+//! The frame, column widths and bar quirks are the script's, including
+//! the unclamped over-100% load bar. Five rows report what the script
+//! meant to print instead of what its field picks produced:
+//!
+//!   - OS drops a codename that VERSION already carries.
+//!   - CPU FREQ falls back to the last-level cache when the host exposes
+//!     no clock (most arm64 servers), instead of " GHz".
+//!   - MACHINE IP prefers the default-route interface and lists the
+//!     other interfaces' addresses on continuation rows.
+//!   - VOLUME is one row per filesystem, not just /, so a btrfs volume
+//!     with several subvolumes shows once.
+//!   - LAST LOGIN keeps the month, weekday and year fields the awk cut
+//!     dropped.
 
 const std = @import("std");
 const Io = std.Io;
 const process = std.process;
 const heap = std.heap;
 const assert = std.debug.assert;
-const fmt = std.fmt;
 const mem = std.mem;
 const posix = std.posix;
 const testing = std.testing;
 const linux = std.os.linux;
 const builtin = @import("builtin");
 
-const use_debug_allocator = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
+const use_safe_allocator = switch (builtin.mode) {
+    .debug, .safe => true,
+    .fast, .small => false,
 };
-var debug_allocator: heap.DebugAllocator(.{}) = .init;
+var safe_allocator: heap.SafeAllocator = .init(heap.page_allocator, .{});
 
 // Basic configuration, mirrors the script's globals. Edit as needed.
 const report_title = "UNITED STATES GRAPHICS COMPANY";
@@ -79,16 +87,6 @@ const Fields = struct {
     fn at(self: Fields, awk_index: u8) []const u8 {
         return if (awk_index == 0 or awk_index > self.count) &.{} else self.items[awk_index - 1];
     }
-
-    /// awk's `print $a, $b, ...`: args joined by single spaces, and empty
-    /// fields keep their separators. This is where "26 12:06:18  -0700"
-    /// gets its double space — $10 does not exist.
-    fn join(self: Fields, w: *Io.Writer, awk_indexes: []const u8) !void {
-        for (awk_indexes, 0..) |index, n| {
-            if (n > 0) try w.writeAll(" ");
-            try w.writeAll(self.at(index));
-        }
-    }
 };
 
 test "Fields awk semantics" {
@@ -97,22 +95,6 @@ test "Fields awk semantics" {
     try testing.expectEqualStrings("45.26.44.184", f.at(3));
     try testing.expectEqualStrings("", f.at(10));
     try testing.expectEqualStrings("", f.at(99));
-
-    var buf: [64]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    try f.join(&w, &.{ 6, 7, 10, 8 });
-    try testing.expectEqualStrings("26 12:06:18  -0700", w.buffered());
-}
-
-test "Fields never-logged row" {
-    const f: Fields = .parse("matt    **Never logged in**");
-    var buf: [64]u8 = undefined;
-    var w: Io.Writer = .fixed(&buf);
-    try f.join(&w, &.{ 4, 5, 8, 6 });
-    // awk emits the separators; upstream's [ "$t" = "in**" ] guard can
-    // never match this, so its "Never logged in" special case is dead
-    // code there. Replicated 1:1; PRINT_DATA pads the blanks away.
-    try testing.expectEqualStrings("in**   ", w.buffered());
 }
 
 fn codepointCount(s: []const u8) usize {
@@ -138,7 +120,7 @@ fn cutCodepoints(s: []const u8, n: usize) []const u8 {
     return s[0..i];
 }
 
-test "cutCodepoints" {
+test cutCodepoints {
     try testing.expectEqualStrings("abc", cutCodepoints("abcdef", 3));
     try testing.expectEqualStrings("█", cutCodepoints("██░░", 1));
     try testing.expectEqualStrings("", cutCodepoints("abc", 0));
@@ -162,7 +144,7 @@ fn parseUint(s: []const u8) ?u64 {
     return v;
 }
 
-test "parseUint" {
+test parseUint {
     try testing.expectEqual(@as(?u64, 16000836), parseUint("16000836"));
     try testing.expectEqual(@as(?u64, null), parseUint("1.5"));
     try testing.expectEqual(@as(?u64, null), parseUint(""));
@@ -182,7 +164,7 @@ fn parseDecimalMilli(s: []const u8) ?u64 {
     return int_part * 1000 + frac * scale;
 }
 
-test "parseDecimalMilli" {
+test parseDecimalMilli {
     try testing.expectEqual(@as(?u64, 2400000), parseDecimalMilli("2400.000"));
     try testing.expectEqual(@as(?u64, 1899), parseDecimalMilli("1.899"));
     try testing.expectEqual(@as(?u64, 18370), parseDecimalMilli("18.37"));
@@ -204,7 +186,7 @@ fn parseHexU64(s: []const u8) ?u64 {
     return v;
 }
 
-test "parseHexU64" {
+test parseHexU64 {
     try testing.expectEqual(@as(?u64, 0x410fd841), parseHexU64("0x00000000410fd841"));
     try testing.expectEqual(@as(?u64, null), parseHexU64("0x"));
 }
@@ -227,7 +209,7 @@ fn isDottedQuad(s: []const u8) bool {
     return octets == 3 and digits > 0;
 }
 
-test "isDottedQuad" {
+test isDottedQuad {
     try testing.expect(isDottedQuad("45.26.44.184"));
     try testing.expect(isDottedQuad("127.0.0.1"));
     try testing.expect(!isDottedQuad("::1"));
@@ -285,7 +267,7 @@ fn keepTruncated(err: anyerror) void {
     assert(err == error.NoSpaceLeft);
 }
 
-test "writeHundredths" {
+test writeHundredths {
     var buf: [32]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try writeHundredths(&w, 1087);
@@ -322,7 +304,7 @@ fn Str(comptime capacity: comptime_int) type {
         }
 
         fn print(self: *Self, comptime format: []const u8, args: anytype) void {
-            const written = fmt.bufPrint(self.bytes[self.len..], format, args) catch {
+            const written = mem.print(self.bytes[self.len..], format, args) catch {
                 self.len = capacity;
                 return;
             };
@@ -367,11 +349,6 @@ const StatFs = extern struct {
 
 comptime {
     assert(@sizeOf(StatFs) == 120);
-}
-
-fn statfsRoot(st: *StatFs) bool {
-    const rc = linux.syscall2(.statfs, @intFromPtr("/".ptr), @intFromPtr(st));
-    return linux.errno(rc) == .SUCCESS;
 }
 
 // struct utmp, LP64 layout: 400 bytes. The padding must sit where glibc
@@ -472,16 +449,45 @@ const nlmsg_align_to: usize = 4;
 const IfaceNames = struct {
     names: [1024]Str(16) = @splat(.{}),
 
-    fn name(self: *const IfaceNames, index: u32) []const u8 {
+    fn byIndex(self: *const IfaceNames, index: u32) []const u8 {
         if (index == 0 or index >= self.names.len) return &.{};
         return self.names[index].view();
     }
+
+    fn byName(self: *const IfaceNames, iface: []const u8) u32 {
+        if (iface.len == 0) return 0;
+        for (self.names, 0..) |slot, i| {
+            if (mem.eql(u8, slot.view(), iface)) return @intCast(i);
+        }
+        return 0;
+    }
 };
 
-/// ifconfig's filter in the script: skip loopback and docker bridges.
-/// podman bridges deliberately pass (upstream behavior, kept).
+/// Virtual interfaces (bridge, veth, container, tunnel) that can carry
+/// an address they only inherited from a real one. The default route
+/// bypasses this list: it names the interface the host actually uses.
+const virtual_iface_prefixes = [_][]const u8{
+    "docker", "br-", "veth", "virbr", "podman", "cni", "flannel",
+    "cali",   "lxc", "tap",  "tunl",  "dummy",
+};
+
 fn isReportedIface(name: []const u8) bool {
-    return !mem.eql(u8, name, "lo") and !mem.startsWith(u8, name, "docker");
+    if (name.len == 0 or mem.eql(u8, name, "lo")) return false;
+    for (virtual_iface_prefixes) |prefix| {
+        if (mem.startsWith(u8, name, prefix)) return false;
+    }
+    return true;
+}
+
+test isReportedIface {
+    try testing.expect(isReportedIface("ens34"));
+    try testing.expect(isReportedIface("tailscale0"));
+    try testing.expect(isReportedIface("wlp0s20f3"));
+    try testing.expect(!isReportedIface("lo"));
+    try testing.expect(!isReportedIface("docker0"));
+    try testing.expect(!isReportedIface("br-dcdc88f09349"));
+    try testing.expect(!isReportedIface("virbr0"));
+    try testing.expect(!isReportedIface("veth1a2b3c"));
 }
 
 fn netlinkSocket() ?i32 {
@@ -646,51 +652,111 @@ test "writeIpv6Compressed" {
     try testing.expectEqualStrings("", w3.buffered());
 }
 
-const AddrPick = struct {
-    v4: Str(64) = .{},
-    v6: Str(64) = .{},
-    have_v4: bool = false,
-    have_v6: bool = false,
+const max_machine_addrs = 4;
 
-    fn writeIpv4(self: *AddrPick, raw: []const u8) void {
-        if (raw.len < 4) return;
-        var w: Io.Writer = .fixed(self.v4.bytes[0..]);
-        w.print("{d}.{d}.{d}.{d}", .{ raw[0], raw[1], raw[2], raw[3] }) catch return;
-        self.v4.len = @intCast(w.buffered().len);
-        self.have_v4 = true;
+const MachineAddr = struct {
+    addr: Str(64) = .{},
+    ifindex: u32 = 0,
+};
+
+/// Every global address on a real interface, in dump order. The
+/// default-route interface is moved to the front: it is the address a
+/// client reaches this box on, not whichever ifindex the kernel
+/// happened to number first (docker bridges used to win that race).
+const AddrList = struct {
+    items: [max_machine_addrs]MachineAddr = @splat(.{}),
+    count: u8 = 0,
+
+    fn add(self: *AddrList, index: u32, text: []const u8) void {
+        if (self.count == max_machine_addrs) return;
+        self.items[self.count] = .{ .ifindex = index };
+        self.items[self.count].addr.setTrunc(text);
+        self.count += 1;
     }
 
-    fn writeIpv6(self: *AddrPick, raw: []const u8) void {
-        var w: Io.Writer = .fixed(self.v6.bytes[0..]);
-        writeIpv6Compressed(&w, raw) catch return;
-        self.v6.len = @intCast(w.buffered().len);
-        self.have_v6 = true;
+    fn putPreferredFirst(self: *AddrList, preferred: u32) void {
+        if (preferred == 0) return;
+        for (self.items[0..self.count], 0..) |item, i| {
+            if (item.ifindex != preferred) continue;
+            const first = self.items[0];
+            self.items[0] = item;
+            self.items[i] = first;
+            return;
+        }
     }
 };
 
-fn dumpAddrPick(fd: i32, names: *const IfaceNames, out: *AddrPick) bool {
+fn formatIpv4(raw: []const u8, out: *Str(64)) void {
+    if (raw.len < 4) return;
+    var w: Io.Writer = .fixed(out.bytes[0..]);
+    w.print("{d}.{d}.{d}.{d}", .{ raw[0], raw[1], raw[2], raw[3] }) catch return;
+    out.len = @intCast(w.buffered().len);
+}
+
+fn formatIpv6(raw: []const u8, out: *Str(64)) void {
+    var w: Io.Writer = .fixed(out.bytes[0..]);
+    writeIpv6Compressed(&w, raw) catch return;
+    out.len = @intCast(w.buffered().len);
+}
+
+/// fe80::/10, ::1, and the all-zeros address: link-local and loopback
+/// say nothing about how to reach the machine.
+fn isUsableIpv6(raw: []const u8) bool {
+    if (raw.len < 16) return false;
+    if (raw[0] == 0xfe and (raw[1] & 0xc0) == 0x80) return false;
+    for (raw[0..15]) |byte| {
+        if (byte != 0) return true;
+    }
+    // Only :: and ::1 are left in the 0:...:n space.
+    return raw[15] > 1;
+}
+
+test isUsableIpv6 {
+    var global: [16]u8 = @splat(0);
+    global[0] = 0x26;
+    global[1] = 0x20;
+    try testing.expect(isUsableIpv6(&global));
+    var link_local: [16]u8 = @splat(0);
+    link_local[0] = 0xfe;
+    link_local[1] = 0x80;
+    link_local[15] = 1;
+    try testing.expect(!isUsableIpv6(&link_local));
+    var loopback: [16]u8 = @splat(0);
+    loopback[15] = 1;
+    try testing.expect(!isUsableIpv6(&loopback));
+}
+
+fn dumpAddrs(fd: i32, names: *const IfaceNames, preferred: u32, out: *AddrList) bool {
     const AddrCtx = struct {
         const Self = @This();
 
         names: *const IfaceNames,
-        pick: *AddrPick,
+        list: *AddrList,
+        preferred: u32,
+        v6: Str(64) = .{},
+        have_v6: bool = false,
 
-        fn on(self: Self, msg: *const NlMsgHdr) void {
+        fn on(self: *Self, msg: *const NlMsgHdr) void {
             if (msg.type != rtm_newaddr) return;
             if (msg.len < @sizeOf(NlMsgHdr) + @sizeOf(IfAddrMsg)) return;
             const raw: [*]align(4) const u8 = @ptrCast(msg);
             const addr: *const IfAddrMsg = @ptrCast(raw + @sizeOf(NlMsgHdr));
-            if (!isReportedIface(self.names.name(addr.index))) return;
-            const want_v4 = addr.family == af_inet and !self.pick.have_v4;
-            const want_v6 = addr.family == af_inet6 and !self.pick.have_v6;
-            if (!want_v4 and !want_v6) return;
+            const is_v4 = addr.family == af_inet;
+            const is_v6 = addr.family == af_inet6;
+            if (!is_v4 and !is_v6) return;
+            // The default route wins over the virtual-interface filter.
+            const is_preferred = self.preferred != 0 and addr.index == self.preferred;
+            if (!is_preferred and !isReportedIface(self.names.byIndex(addr.index))) return;
+            if (is_v4 and self.list.count == max_machine_addrs) return;
+            if (is_v6 and self.have_v6) return;
+
             var attr_off: usize = @sizeOf(NlMsgHdr) + @sizeOf(IfAddrMsg);
             while (attr_off + @sizeOf(RtAttr) <= msg.len) {
                 const attr: *const RtAttr = @ptrCast(@alignCast(raw + attr_off));
                 if (attr.len < @sizeOf(RtAttr)) return;
                 // ip(8) reports IFA_LOCAL for IPv4 and IFA_ADDRESS for
                 // IPv6; ifconfig's inet/inet6 lines carry the same bytes.
-                const relevant = if (addr.family == af_inet)
+                const relevant = if (is_v4)
                     (attr.type == ifa_local or attr.type == ifa_address)
                 else
                     attr.type == ifa_address;
@@ -698,38 +764,107 @@ fn dumpAddrPick(fd: i32, names: *const IfaceNames, out: *AddrPick) bool {
                     const start = attr_off + @sizeOf(RtAttr);
                     const raw_len = @min(@as(usize, attr.len) - @sizeOf(RtAttr), msg.len - start);
                     const value = raw[start .. start + raw_len];
-                    if (addr.family == af_inet) {
-                        self.pick.writeIpv4(value);
-                    } else {
-                        self.pick.writeIpv6(value);
+                    if (is_v4) {
+                        var text: Str(64) = .{};
+                        formatIpv4(value, &text);
+                        if (text.len > 0) self.list.add(addr.index, text.view());
+                    } else if (isUsableIpv6(value)) {
+                        formatIpv6(value, &self.v6);
+                        self.have_v6 = self.v6.len > 0;
                     }
-                    if (self.pick.have_v4 or self.pick.have_v6) return;
+                    return;
                 }
                 attr_off += mem.alignForward(usize, attr.len, nlmsg_align_to);
             }
         }
     };
     const seq: u32 = 101;
-    const ctx: AddrCtx = .{ .names = names, .pick = out };
-    return netlinkRecvDump(fd, rtm_getaddr, seq, ctx, AddrCtx.on);
+    var ctx: AddrCtx = .{ .names = names, .list = out, .preferred = preferred };
+    if (!netlinkRecvDump(fd, rtm_getaddr, seq, &ctx, AddrCtx.on)) return false;
+    // IPv6 is the fallback address family, and only the first one: a
+    // tailnet assigns a v4 and a v6 to the same interface, and printing
+    // both says nothing extra.
+    if (ctx.list.count == 0 and ctx.have_v6) ctx.list.add(0, ctx.v6.view());
+    return true;
 }
 
-/// ifconfig's pick, order included: the lowest-ifindex interface that is
-/// not "lo" and not docker* carrying an IPv4 address; else the first
-/// such IPv6; else the script's "No IP found".
-fn gatherMachineIp(out: *Str(64)) void {
-    out.set("No IP found");
-    const fd = netlinkSocket() orelse return;
+/// The interface carrying the IPv4 default route, by lowest metric.
+fn defaultRouteIface(route: []const u8, out: *Str(16)) void {
+    out.setTrunc("");
+    var best_metric: u64 = std.math.maxInt(u64);
+    var rest = route;
+    var header = true;
+    while (rest.len > 0) {
+        const nl = mem.findScalar(u8, rest, '\n') orelse rest.len;
+        const line = rest[0..nl];
+        rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
+        if (header) {
+            header = false;
+            continue;
+        }
+        // iface destination gateway flags refcnt use metric mask ...
+        const fields: Fields = .parse(line);
+        if (!mem.eql(u8, fields.at(2), "00000000")) continue;
+        if (!mem.eql(u8, fields.at(8), "00000000")) continue;
+        const metric = parseUint(fields.at(7)) orelse 0;
+        if (metric > best_metric) continue;
+        best_metric = metric;
+        out.setTrunc(fields.at(1));
+    }
+}
+
+test defaultRouteIface {
+    const route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask" ++
+        "\t\tMTU\tWindow\tIRTT\n" ++
+        "docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n" ++
+        "ens34\t00000000\t01012A0A\t0003\t0\t0\t1002\t00000000\t0\t0\t0\n" ++
+        "ens34\t00012A0A\t00000000\t0001\t0\t0\t1002\t00FFFFFF\t0\t0\t0\n";
+    var out: Str(16) = .{};
+    defaultRouteIface(route, &out);
+    try testing.expectEqualStrings("ens34", out.view());
+}
+
+/// MACHINE IP row plus one continuation row per extra interface, so a
+/// host with a LAN address and a tailnet address shows both.
+fn gatherMachineIps(
+    io: Io,
+    primary: *Str(64),
+    extra: *[max_machine_addrs]Str(64),
+    extra_count: *u8,
+) void {
+    extra_count.* = 0;
+    var route_buf: [read_max]u8 = undefined;
+    const route = readFileOrEmpty(io, "/proc/net/route", &route_buf);
+    var preferred_name: Str(16) = .{};
+    defaultRouteIface(route, &preferred_name);
+
+    var list: AddrList = .{};
+    const fd = netlinkSocket() orelse {
+        primary.set("No IP found");
+        return;
+    };
     defer _ = linux.close(fd);
-    if (!netlinkBind(fd)) return;
+    if (!netlinkBind(fd)) {
+        primary.set("No IP found");
+        return;
+    }
     var names: IfaceNames = .{};
-    if (!dumpLinkNames(fd, &names)) return;
-    var pick: AddrPick = .{};
-    if (!dumpAddrPick(fd, &names, &pick)) return;
-    if (pick.have_v4) {
-        out.setTrunc(pick.v4.view());
-    } else if (pick.have_v6) {
-        out.setTrunc(pick.v6.view());
+    if (!dumpLinkNames(fd, &names)) {
+        primary.set("No IP found");
+        return;
+    }
+    const preferred = names.byName(preferred_name.view());
+    if (!dumpAddrs(fd, &names, preferred, &list) or list.count == 0) {
+        primary.set("No IP found");
+        return;
+    }
+    list.putPreferredFirst(preferred);
+
+    primary.setTrunc(list.items[0].addr.view());
+    for (list.items[1..list.count]) |item| {
+        var row = &extra[extra_count.*];
+        row.print("{s} {s}", .{ names.byIndex(item.ifindex), item.addr.view() });
+        extra_count.* += 1;
     }
 }
 
@@ -764,7 +899,7 @@ const month_names = [12][]const u8{
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
 
-test "civilFromDays" {
+test civilFromDays {
     const epoch = civilFromDays(0);
     try testing.expectEqual(@as(i64, 1970), epoch.year);
     try testing.expectEqual(@as(u32, 1), epoch.month);
@@ -792,15 +927,19 @@ const Tz = struct {
     transitions: [max_transitions]i64 = undefined,
     type_indices: [max_transitions]u8 = undefined,
     utoffs: [max_types]i32 = undefined,
-    is_dst: std.StaticBitSet(max_types) = .initEmpty(),
+    is_dst: std.bit_set.Static(max_types) = .empty,
     n_transitions: u16 = 0,
     n_types: u16 = 0,
+
+    inline fn readInt(comptime T: type, buffer: *const [@divExact(@typeInfo(T).int.bits, 8)]u8) T {
+        return mem.readInt(T, buffer, .big);
+    }
 
     fn headerCounts(buf: []const u8) ?[6]u32 {
         if (buf.len < 44) return null;
         var counts: [6]u32 = undefined;
         for (0..6) |i| {
-            counts[i] = mem.readInt(u32, buf[20 + i * 4 ..][0..4], .big);
+            counts[i] = readInt(u32, buf[20 + i * 4 ..][0..4]);
         }
         return counts;
     }
@@ -835,7 +974,7 @@ const Tz = struct {
         var off: usize = v2_start + 44;
         for (0..counts[3]) |i| {
             if (off + 8 > buf.len) return null;
-            self.transitions[i] = mem.readInt(i64, buf[off..][0..8], .big);
+            self.transitions[i] = readInt(i64, buf[off..][0..8]);
             off += 8;
         }
         for (0..counts[3]) |i| {
@@ -845,7 +984,7 @@ const Tz = struct {
         }
         for (0..counts[4]) |i| {
             if (off + 6 > buf.len) return null;
-            self.utoffs[i] = mem.readInt(i32, buf[off..][0..4], .big);
+            self.utoffs[i] = readInt(i32, buf[off..][0..4]);
             self.is_dst.setValue(i, buf[off + 4] != 0);
             off += 6;
         }
@@ -915,7 +1054,7 @@ fn writeTzOffset(w: *Io.Writer, offset_seconds: i32) !void {
     try w.print("{c}{d:0>2}{d:0>2}", .{ sign, magnitude / 3600, (magnitude % 3600) / 60 });
 }
 
-test "writeTzOffset" {
+test writeTzOffset {
     var buf: [8]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try writeTzOffset(&w, -25200);
@@ -929,6 +1068,11 @@ test "writeTzOffset" {
 fn gatherOsName(io: Io, out: *Str(64)) void {
     var os_release_buf: [read_max]u8 = undefined;
     const os_release = readFileOrEmpty(io, "/etc/os-release", &os_release_buf);
+    formatOsName(os_release, out);
+}
+
+fn formatOsName(os_release: []const u8, out: *Str(64)) void {
+    out.setTrunc("");
     var id: Str(32) = .{};
     var version: []const u8 = "";
     var codename: Str(32) = .{};
@@ -950,7 +1094,31 @@ fn gatherOsName(io: Io, out: *Str(64)) void {
         if (mem.eql(u8, key, "VERSION")) version = value;
         if (mem.eql(u8, key, "VERSION_CODENAME")) upperFirst(value, &codename);
     }
-    out.print("{s} {s} {s}", .{ id.view(), version, codename.view() });
+    out.print("{s} {s}", .{ id.view(), version });
+    // NixOS bakes the codename into VERSION ("26.11 (Zokor)"), so the
+    // script's third field printed "Nixos 26.11 (Zokor) Zokor".
+    if (codename.view().len > 0 and std.ascii.findIgnoreCase(version, codename.view()) == null) {
+        out.print(" {s}", .{codename.view()});
+    }
+}
+
+test formatOsName {
+    var out: Str(64) = .{};
+    formatOsName(
+        "ID=nixos\nVERSION=\"26.11 (Zokor)\"\nVERSION_CODENAME=zokor\n",
+        &out,
+    );
+    try testing.expectEqualStrings("Nixos 26.11 (Zokor)", out.view());
+    formatOsName(
+        "ID=debian\nVERSION=\"12 (bookworm)\"\nVERSION_CODENAME=bookworm\n",
+        &out,
+    );
+    try testing.expectEqualStrings("Debian 12 (bookworm)", out.view());
+    formatOsName(
+        "ID=arch\nVERSION=\"rolling\"\nVERSION_CODENAME=\"\"\n",
+        &out,
+    );
+    try testing.expectEqualStrings("Arch rolling", out.view());
 }
 
 fn upperFirst(s: []const u8, out: *Str(32)) void {
@@ -960,7 +1128,7 @@ fn upperFirst(s: []const u8, out: *Str(32)) void {
     }
 }
 
-test "upperFirst" {
+test upperFirst {
     var out: Str(32) = .{};
     upperFirst("nixos", &out);
     try testing.expectEqualStrings("Nixos", out.view());
@@ -999,7 +1167,7 @@ fn resolveHostname(uts: *const posix.utsname, hosts: []const u8, out: *Str(128))
     }
 }
 
-test "resolveHostname" {
+test resolveHostname {
     const hosts = "127.0.0.1 localhost\n\n127.0.0.2 launchpad\n10.0.0.5 box.example.com box\n";
     var uts: posix.utsname = undefined;
     @memset(&uts.nodename, 0);
@@ -1048,7 +1216,7 @@ fn gatherDnsServersScan(resolv: []const u8, out: *[max_dns_entries]Str(64), coun
     }
 }
 
-test "gatherDnsServersScan" {
+test gatherDnsServersScan {
     const resolv = "# Generated by resolvconf\n" ++
         "search tail45c3.ts.net\n" ++
         "nameserver 127.0.0.1\n" ++
@@ -1080,7 +1248,7 @@ fn passwdUserName(passwd: []const u8, uid: u32) ?[]const u8 {
     return null;
 }
 
-test "passwdUserName" {
+test passwdUserName {
     const passwd = "root:x:0:0:System administrator:/root:/run/current-system/sw/bin/bash\n" ++
         "matt:x:1001:100::/home/matt:/run/current-system/sw/bin/zsh\n";
     try testing.expectEqualStrings("matt", passwdUserName(passwd, 1001).?);
@@ -1088,17 +1256,20 @@ test "passwdUserName" {
     try testing.expectEqual(@as(?[]const u8, null), passwdUserName(passwd, 42));
 }
 
-/// who am i, in-process: our controlling terminal's USER_PROCESS record.
-/// ut_host is the remote address sshd recorded at login. readlinkat is
-/// raw because std.Io has no readlink path.
-fn gatherClientIp(io: Io, out: *Str(256)) void {
+/// The client address of this session. $SSH_CONNECTION answers when the
+/// session has no tty (ssh command, agent tooling); otherwise read the
+/// USER_PROCESS record for our controlling terminal, where ut_host is the
+/// address sshd recorded at login. readlinkat is raw because std.Io has
+/// no readlink path. A local login records an empty host, which renders
+/// the script's "Not connected".
+fn gatherClientIp(io: Io, environ: process.Environ, out: *Str(256)) void {
     out.set("Not connected");
-    var link_buf: [64]u8 = undefined;
-    const rc = linux.readlinkat(posix.AT.FDCWD, "/proc/self/fd/0", &link_buf, link_buf.len);
-    if (linux.errno(rc) != .SUCCESS) return;
-    const link = link_buf[0..@intCast(rc)];
-    if (!mem.startsWith(u8, link, "/dev/")) return;
-    const tty_line = link[5..];
+    if (sshConnectionPeer(environ)) |peer| {
+        out.setTrunc(peer);
+        return;
+    }
+    var tty_line: Str(32) = .{};
+    if (!controllingTtyLine(&tty_line)) return;
 
     var utmp_buf: [utmp_read_max]u8 = undefined;
     const utmp = readFileOrEmpty(io, "/var/run/utmp", &utmp_buf);
@@ -1107,14 +1278,58 @@ fn gatherClientIp(io: Io, out: *Str(256)) void {
         // off advances by whole 400-byte records, so alignment holds.
         const record: *const UtmpRecord = @ptrCast(@alignCast(utmp[off..].ptr));
         if (record.ut_type != ut_user_process) continue;
-        if (!mem.eql(u8, mem.sliceTo(&record.ut_line, 0), tty_line)) continue;
+        if (!mem.eql(u8, mem.sliceTo(&record.ut_line, 0), tty_line.view())) continue;
         const host = mem.sliceTo(&record.ut_host, 0);
-        // A local login records an empty host; who am i shows none, so
-        // the script's $5 stays empty and renders "Not connected".
         if (host.len == 0) return;
         out.setTrunc(host);
         return;
     }
+}
+
+/// "client_addr client_port server_addr server_port" -> client_addr.
+fn sshConnectionPeer(environ: process.Environ) ?[]const u8 {
+    const value = environ.getPosix("SSH_CONNECTION") orelse return null;
+    const fields: Fields = .parse(value);
+    return if (fields.at(1).len > 0) fields.at(1) else null;
+}
+
+/// The tty a process is attached to, even when stdin is a pipe: any
+/// /proc/self/fd/N link into /dev counts. A shell that redirects all
+/// three standard streams still keeps the terminal open.
+fn controllingTtyLine(out: *Str(32)) bool {
+    var link_buf: [64]u8 = undefined;
+    for (0..16) |fd| {
+        var path_buf: [33]u8 = undefined;
+        const path = mem.print(path_buf[0..32], "/proc/self/fd/{d}", .{fd}) catch continue;
+        path_buf[path.len] = 0;
+        const rc = linux.readlinkat(
+            posix.AT.FDCWD,
+            @ptrCast(&path_buf),
+            &link_buf,
+            link_buf.len,
+        );
+        if (linux.errno(rc) != .SUCCESS) continue;
+        const line = ttyLineFromLink(link_buf[0..@intCast(rc)]) orelse continue;
+        out.setTrunc(line);
+        return true;
+    }
+    return false;
+}
+
+/// /dev/pts/62 is "pts/62" in utmp; /dev/null and pipes are not ttys.
+fn ttyLineFromLink(link: []const u8) ?[]const u8 {
+    if (!mem.startsWith(u8, link, "/dev/")) return null;
+    const line = link[5..];
+    if (mem.startsWith(u8, line, "pts/") or mem.startsWith(u8, line, "tty")) return line;
+    return null;
+}
+
+test ttyLineFromLink {
+    try testing.expectEqualStrings("pts/62", ttyLineFromLink("/dev/pts/62").?);
+    try testing.expectEqualStrings("tty1", ttyLineFromLink("/dev/tty1").?);
+    try testing.expectEqual(@as(?[]const u8, null), ttyLineFromLink("/dev/null"));
+    try testing.expectEqual(@as(?[]const u8, null), ttyLineFromLink("pipe:[10307679]"));
+    try testing.expectEqual(@as(?[]const u8, null), ttyLineFromLink("/dev/shm"));
 }
 
 test "UtmpRecord field offsets" {
@@ -1199,7 +1414,7 @@ fn armModelName(midr: u64) ?[]const u8 {
     return null;
 }
 
-test "armModelName" {
+test armModelName {
     // Verified against lscpu on this host: midr 0x410fd841 -> Neoverse-V3.
     try testing.expectEqualStrings("Neoverse-V3", armModelName(0x410fd841).?);
     try testing.expectEqual(@as(?[]const u8, null), armModelName(0x410fffff));
@@ -1217,7 +1432,7 @@ fn writeSquashedFields(w: *Io.Writer, model: []const u8) !void {
     }
 }
 
-test "writeSquashedFields" {
+test writeSquashedFields {
     var buf: [96]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try writeSquashedFields(&w, "Neoverse-V3");
@@ -1243,18 +1458,10 @@ fn findCpuinfoLine(comptime key: []const u8, cpuinfo: []const u8, skip_bios: boo
 /// sysfs and /proc/sys values end with a newline; cut every blank kind
 /// or every parse of a number from them fails on the trailing byte.
 fn trim(s: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = s.len;
-    while (start < end and isBlank(start, s)) start += 1;
-    while (end > start and isBlank(end - 1, s)) end -= 1;
-    return s[start..end];
+    return mem.trim(u8, s, " \t\n\r");
 }
 
-fn isBlank(i: usize, s: []const u8) bool {
-    return s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r';
-}
-
-test "trim strips newlines" {
+test trim {
     try testing.expectEqualStrings("0x410fd841", trim("0x410fd841\n"));
     try testing.expectEqualStrings("0-3", trim("0-3\n"));
     try testing.expectEqualStrings("60", trim("60\n"));
@@ -1282,24 +1489,113 @@ fn gatherCpuModel(cpuinfo: []const u8, midr_str: ?[]const u8, out: *Str(96)) voi
     out.setTrunc(w.buffered());
 }
 
-fn gatherCpuFreqGh(cpuinfo: []const u8, out: *Str(16)) void {
-    // "%.2f GHz" from the first cpuinfo MHz line, or empty — this board
-    // exposes no frequency anywhere, and the row renders " GHz".
+/// "%.2f GHz" for the first clock source that answers, or empty. x86
+/// puts the current clock in /proc/cpuinfo; arm64 usually has neither
+/// that nor a cpufreq driver, which is why this can come back empty.
+fn gatherCpuFreqGh(io: Io, cpuinfo: []const u8, out: *Str(16)) void {
     out.setTrunc("");
-    const value = findCpuinfoLine("cpu MHz", cpuinfo, false) orelse return;
-    const milli = parseDecimalMilli(trim(value)) orelse return;
-    const gh_hundredths: u64 = roundDiv(milli, 10_000);
-    out.print("{d}.{d:0>2}", .{ gh_hundredths / 100, gh_hundredths % 100 });
+    if (findCpuinfoLine("cpu MHz", cpuinfo, false)) |value| {
+        if (parseDecimalMilli(trim(value))) |milli| {
+            setGhz(out, roundDiv(milli, 10_000));
+            return;
+        }
+    }
+    // cpufreq in kHz. Current first: it is the reading lscpu prints.
+    const cpufreq_paths = [_][]const u8{
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq",
+    };
+    for (cpufreq_paths) |path| {
+        var buf: [sysfs_read_max]u8 = undefined;
+        const khz = parseUint(trim(readFileOrEmpty(io, path, &buf))) orelse continue;
+        if (khz == 0) continue;
+        setGhz(out, roundDiv(khz, 10_000));
+        return;
+    }
 }
 
-test "gatherCpuFreqGh" {
+fn setGhz(out: *Str(16), hundredths: u64) void {
+    out.print("{d}.{d:0>2}", .{ hundredths / 100, hundredths % 100 });
+}
+
+test gatherCpuFreqGh {
     const cpuinfo = "processor\t: 0\n" ++
         "vendor_id\t: GenuineIntel\n" ++
         "cpu family\t: 6\n" ++
         "cpu MHz\t\t: 2400.000\n";
     var out: Str(16) = .{};
-    gatherCpuFreqGh(cpuinfo, &out);
+    gatherCpuFreqGh(testing.io, cpuinfo, &out);
     try testing.expectEqualStrings("2.40", out.view());
+}
+
+/// Last-level Unified cache, summed across instances like lscpu's
+/// "L3 cache: 48 MiB (1 instance)". The substitute row on hosts that
+/// expose no clock: /sys/devices/system/cpu/cpu0/cpufreq is absent and
+/// /proc/cpuinfo has no cpu MHz on most arm64 servers.
+fn gatherCpuCache(io: Io, out: *Str(24)) void {
+    out.setTrunc("");
+    var best_level: u64 = 0;
+    var best_bytes: u64 = 0;
+    for (0..8) |index| {
+        var path_buf: [96]u8 = undefined;
+        const level_path = mem.print(
+            &path_buf,
+            "/sys/devices/system/cpu/cpu0/cache/index{d}/level",
+            .{index},
+        ) catch continue;
+        var level_buf: [sysfs_read_max]u8 = undefined;
+        const level = parseUint(trim(readFileOrEmpty(io, level_path, &level_buf))) orelse continue;
+        const type_path = mem.print(
+            &path_buf,
+            "/sys/devices/system/cpu/cpu0/cache/index{d}/type",
+            .{index},
+        ) catch continue;
+        var type_buf: [sysfs_read_max]u8 = undefined;
+        if (!mem.eql(u8, trim(readFileOrEmpty(io, type_path, &type_buf)), "Unified")) continue;
+        const size_path = mem.print(
+            &path_buf,
+            "/sys/devices/system/cpu/cpu0/cache/index{d}/size",
+            .{index},
+        ) catch continue;
+        var size_buf: [sysfs_read_max]u8 = undefined;
+        const size_text = trim(readFileOrEmpty(io, size_path, &size_buf));
+        const size = parseCacheSize(size_text) orelse continue;
+        if (level > best_level) {
+            best_level = level;
+            best_bytes = size;
+        } else if (level == best_level) {
+            best_bytes += size;
+        }
+    }
+    if (best_level == 0 or best_bytes == 0) return;
+    if (best_bytes >= 1 << 20) {
+        out.print("L{d} {d} MiB", .{ best_level, best_bytes / (1 << 20) });
+    } else {
+        out.print("L{d} {d} KiB", .{ best_level, best_bytes / 1024 });
+    }
+}
+
+/// sysfs cache sizes are "32K", "2048K", or occasionally "1M".
+fn parseCacheSize(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    const multiplier: u64 = switch (s[s.len - 1]) {
+        'K', 'k' => 1024,
+        'M', 'm' => 1 << 20,
+        else => 1,
+    };
+    const digits = if (multiplier == 1) s else s[0 .. s.len - 1];
+    const value = parseUint(digits) orelse return null;
+    return value * multiplier;
+}
+
+test parseCacheSize {
+    try testing.expectEqual(@as(?u64, 64 * 1024), parseCacheSize("64K"));
+    try testing.expectEqual(@as(?u64, 49152 * 1024), parseCacheSize("49152K"));
+    try testing.expectEqual(@as(?u64, 2 * 1024 * 1024), parseCacheSize("2M"));
+    try testing.expectEqual(@as(?u64, 1024), parseCacheSize("1024"));
+    try testing.expectEqual(@as(?u64, null), parseCacheSize(""));
+    try testing.expectEqual(@as(?u64, null), parseCacheSize("K"));
 }
 
 /// lscpu's Hypervisor vendor names, util-linux 2.42.3 lscpu.c
@@ -1403,7 +1699,7 @@ fn walkPresentCpus(
     }
 }
 
-test "walkPresentCpus" {
+test walkPresentCpus {
     const Collector = struct {
         const Self = @This();
 
@@ -1490,7 +1786,7 @@ fn readTopologyInto(
     path_buf: *[96]u8,
     cpu: u32,
 ) void {
-    const path = fmt.bufPrint(
+    const path = mem.print(
         path_buf,
         "/sys/devices/system/cpu/cpu{d}/topology/" ++ kind,
         .{cpu},
@@ -1556,30 +1852,247 @@ test "gatherMeminfo core" {
 
 // ------------------------------------------------------------------- disk
 
-const DiskKind = enum { zfs, root };
+/// One row set per filesystem, not per mount. A btrfs filesystem with
+/// several subvolumes (plus the ro bind mount NixOS adds under /nix/store)
+/// shows the same block counts on every mount; folding by device keeps one
+/// row and lists the mountpoints it backs.
+const max_volumes = 8;
+const max_fs_mounts = 4;
 
-const Disk = struct {
-    kind: DiskKind = .root,
+const Volume = struct {
+    device: Str(80) = .{},
+    mounts: [max_fs_mounts]Str(48) = @splat(.{}),
+    mount_count: u8 = 0,
     used_mib: u64 = 0,
     total_mib: u64 = 0,
+    zfs: bool = false,
+
+    /// Nested mounts of the same filesystem (/nix then /nix/store) name
+    /// one directory twice; keep the parent.
+    fn addMount(self: *Volume, mount: []const u8) void {
+        var i: u8 = 0;
+        while (i < self.mount_count) : (i += 1) {
+            const existing = self.mounts[i].view();
+            if (sameOrUnder(existing, mount)) return;
+            if (sameOrUnder(mount, existing)) {
+                self.mounts[i].setTrunc(mount);
+                return;
+            }
+        }
+        if (self.mount_count < max_fs_mounts) {
+            self.mounts[self.mount_count].setTrunc(mount);
+            self.mount_count += 1;
+        }
+    }
+
+    /// Mountpoints in display order: shortest first, so the label of a
+    /// filesystem with several subvolumes names the mounts a reader
+    /// recognizes before the long home path. Ties alphabetical.
+    fn label(self: *const Volume, out: *Str(64)) void {
+        var order: [max_fs_mounts]u8 = undefined;
+        for (0..self.mount_count) |i| order[i] = @intCast(i);
+        for (1..self.mount_count) |i| {
+            const key = order[i];
+            var j = i;
+            while (j > 0) : (j -= 1) {
+                const previous = self.mounts[order[j - 1]].view();
+                if (mountLess(previous, self.mounts[key].view())) break;
+                order[j] = order[j - 1];
+            }
+            order[j] = key;
+        }
+        out.setTrunc("");
+        for (0..self.mount_count) |i| {
+            if (i > 0) out.print(",", .{});
+            out.print("{s}", .{self.mounts[order[i]].view()});
+        }
+    }
 };
 
-fn gatherDisk(io: Io) Disk {
-    // The zfs branch keeps its own row set (ZFS HEALTH etc.) but shares
-    // the root filesystem's numbers: the assumed zroot/ROOT/os dataset is
-    // the one mounted at /. zpool(8) health has no fork-free source and
-    // no zfs host was available to verify against, so health is a
-    // constant (a flagged deviation, not a faithful port).
+fn mountLess(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return a.len < b.len;
+    return mem.order(u8, a, b) == .lt;
+}
+
+test mountLess {
+    try testing.expect(mountLess("/", "/boot"));
+    try testing.expect(mountLess("/nix", "/Users/matt"));
+    try testing.expect(mountLess("/nix", "/tmp"));
+    try testing.expect(!mountLess("/tmp", "/nix"));
+}
+
+/// a == b, or b sits under a (path-component boundary, not a string
+/// prefix: /home does not contain /homework).
+fn sameOrUnder(a: []const u8, b: []const u8) bool {
+    if (!mem.startsWith(u8, b, a)) return false;
+    return b.len == a.len or a.len == 1 or b[a.len] == '/';
+}
+
+test sameOrUnder {
+    try testing.expect(sameOrUnder("/", "/nix"));
+    try testing.expect(sameOrUnder("/nix", "/nix/store"));
+    try testing.expect(sameOrUnder("/nix", "/nix"));
+    try testing.expect(!sameOrUnder("/nix", "/nixos"));
+    try testing.expect(!sameOrUnder("/home", "/homework"));
+    try testing.expect(!sameOrUnder("/nix", "/tmp"));
+}
+
+const Volumes = struct {
+    items: [max_volumes]Volume = @splat(.{}),
+    count: u8 = 0,
+
+    fn find(self: *Volumes, device: []const u8) ?*Volume {
+        for (self.items[0..self.count]) |*volume| {
+            if (mem.eql(u8, volume.device.view(), device)) return volume;
+        }
+        return null;
+    }
+
+    fn anyZfs(self: *const Volumes) bool {
+        for (self.items[0..self.count]) |volume| {
+            if (volume.zfs) return true;
+        }
+        return false;
+    }
+};
+
+/// Kernel and synthetic filesystems that carry no capacity worth a row.
+/// overlay and squashfs stay: they are a container's and an installer's
+/// real root.
+const pseudo_fstypes = [_][]const u8{
+    "proc",       "sysfs",   "devtmpfs",  "devpts",      "tmpfs",
+    "ramfs",      "cgroup",  "cgroup2",   "securityfs",  "pstore",
+    "efivarfs",   "bpf",     "debugfs",   "mqueue",      "configfs",
+    "hugetlbfs",  "tracefs", "fusectl",   "binfmt_misc", "autofs",
+    "rpc_pipefs", "nsfs",    "selinuxfs",
+};
+
+fn isPseudoFs(fstype: []const u8) bool {
+    for (pseudo_fstypes) |pseudo| {
+        if (mem.eql(u8, fstype, pseudo)) return true;
+    }
+    return false;
+}
+
+/// /proc/mounts escapes space, tab, newline and backslash as octal.
+fn unescapeMount(s: []const u8, out: []u8) ?[]const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (n == out.len) return null;
+        if (s[i] != '\\' or i + 3 >= s.len) {
+            out[n] = s[i];
+            n += 1;
+            i += 1;
+            continue;
+        }
+        const code = parseOctal(s[i + 1 .. i + 4]) orelse {
+            out[n] = s[i];
+            n += 1;
+            i += 1;
+            continue;
+        };
+        out[n] = code;
+        n += 1;
+        i += 4;
+    }
+    return out[0..n];
+}
+
+fn parseOctal(s: []const u8) ?u8 {
+    var v: u16 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '7') return null;
+        v = v * 8 + (c - '0');
+    }
+    return @intCast(v);
+}
+
+test unescapeMount {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("/", unescapeMount("/", &buf).?);
+    try testing.expectEqualStrings("/mnt/my disk", unescapeMount("/mnt/my\\040disk", &buf).?);
+    try testing.expectEqualStrings("/a\\b", unescapeMount("/a\\134b", &buf).?);
+}
+
+fn statfsPath(path: []const u8, st: *StatFs) bool {
+    var buf: [4096]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const rc = linux.syscall2(.statfs, @intFromPtr(&buf), @intFromPtr(st));
+    return linux.errno(rc) == .SUCCESS;
+}
+
+fn gatherVolumes(io: Io) Volumes {
     var mounts_buf: [mounts_read_max]u8 = undefined;
     const mounts = readFileOrEmpty(io, "/proc/mounts", &mounts_buf);
-    const kind: DiskKind = if (mem.find(u8, mounts, "zfs") != null) .zfs else .root;
-    var st: StatFs = undefined;
-    if (!statfsRoot(&st)) return .{ .kind = kind };
-    const frsize: u64 = if (st.f_frsize > 0) @intCast(st.f_frsize) else @intCast(st.f_bsize);
-    const total_mib = divCeilProduct(st.f_blocks, frsize, 1 << 20);
-    const used_blocks = st.f_blocks -| st.f_bfree;
-    const used_mib = divCeilProduct(used_blocks, frsize, 1 << 20);
-    return .{ .kind = kind, .used_mib = used_mib, .total_mib = total_mib };
+    var out: Volumes = .{};
+    var rest = mounts;
+    while (rest.len > 0) {
+        const nl = mem.findScalar(u8, rest, '\n') orelse rest.len;
+        const line = rest[0..nl];
+        rest = if (nl < rest.len) rest[nl + 1 ..] else rest[nl..];
+        const fields: Fields = .parse(line);
+        // device mountpoint fstype options dump pass
+        const device = fields.at(1);
+        const fstype = fields.at(3);
+        if (device.len == 0 or isPseudoFs(fstype)) continue;
+        var path_buf: [4096]u8 = undefined;
+        const mount = unescapeMount(fields.at(2), &path_buf) orelse continue;
+        var st: StatFs = undefined;
+        if (!statfsPath(mount, &st)) continue;
+        const frsize: u64 = if (st.f_frsize > 0) @intCast(st.f_frsize) else @intCast(st.f_bsize);
+        if (frsize == 0 or st.f_blocks == 0) continue;
+        const total_mib = divCeilProduct(st.f_blocks, frsize, 1 << 20);
+        if (total_mib == 0) continue;
+        if (out.find(device)) |volume| {
+            volume.addMount(mount);
+            continue;
+        }
+        if (out.count == max_volumes) continue;
+        const volume = &out.items[out.count];
+        volume.* = .{
+            .used_mib = divCeilProduct(st.f_blocks -| st.f_bfree, frsize, 1 << 20),
+            .total_mib = total_mib,
+            .zfs = mem.eql(u8, fstype, "zfs"),
+        };
+        volume.device.setTrunc(device);
+        volume.addMount(mount);
+        out.count += 1;
+    }
+    sortVolumes(&out);
+    return out;
+}
+
+/// Root first, then by label: mount order is boot order, which moves
+/// when a unit reorders its mounts.
+fn sortVolumes(volumes: *Volumes) void {
+    var labels: [max_volumes]Str(64) = @splat(.{});
+    for (0..volumes.count) |i| volumes.items[i].label(&labels[i]);
+    for (1..volumes.count) |i| {
+        const key = volumes.items[i];
+        const key_label = labels[i];
+        var j = i;
+        while (j > 0 and mem.order(u8, labels[j - 1].view(), key_label.view()) == .gt) : (j -= 1) {
+            volumes.items[j] = volumes.items[j - 1];
+            labels[j] = labels[j - 1];
+        }
+        volumes.items[j] = key;
+        labels[j] = key_label;
+    }
+}
+
+test "Volume addMount folds nested mounts" {
+    var volume: Volume = .{};
+    volume.addMount("/nix");
+    volume.addMount("/nix/store");
+    volume.addMount("/tmp");
+    volume.addMount("/nix");
+    try testing.expectEqual(@as(u8, 2), volume.mount_count);
+    var label: Str(64) = .{};
+    volume.label(&label);
+    try testing.expectEqualStrings("/nix,/tmp", label.view());
 }
 
 // -------------------------------------------------------------- last login
@@ -1590,78 +2103,68 @@ const LastLogin = struct {
     ip_present: bool = false,
 };
 
-fn gatherLastLogin(
-    io: Io,
-    tz: *const Tz,
-    uid_for_record: u32,
-    user_name: []const u8,
-) LastLogin {
+fn gatherLastLogin(io: Io, tz: *const Tz, uid_for_record: u32) LastLogin {
     var record_buf: [@sizeOf(LastlogRecord)]u8 = undefined;
     const offset: u64 = @as(u64, uid_for_record) * @sizeOf(LastlogRecord);
     const raw = readRecordOrEmpty(io, "/var/log/lastlog", &record_buf, offset);
 
-    // Emit the exact two-line shape legacy lastlog(8) printed, so the
-    // awk field picks below are the script's, unchanged.
-    var row: Str(512) = .{};
-    if (raw.len == @sizeOf(LastlogRecord)) {
-        const record: *const LastlogRecord = @ptrCast(@alignCast(raw.ptr));
-        if (record.ll_time != 0) {
-            const offset_seconds = tz.offsetAt(record.ll_time);
-            const local: i64 = record.ll_time + offset_seconds;
-            const days = @divFloor(local, 86400);
-            const secs_of_day: u64 = @intCast(@mod(local, 86400));
-            const date = civilFromDays(days);
-            var offset_str: Str(8) = .{};
-            {
-                var ow: Io.Writer = .fixed(offset_str.bytes[0..]);
-                writeTzOffset(&ow, offset_seconds) catch |err| keepTruncated(err);
-                offset_str.len = @intCast(ow.buffered().len);
-            }
-            row.print("{s} {s} {s} {s} {s} {d} ", .{
-                user_name,
-                mem.sliceTo(&record.ll_line, 0),
-                mem.sliceTo(&record.ll_host, 0),
-                weekday_names[weekdayFromDays(days)],
-                month_names[date.month - 1],
-                date.day,
-            });
-            row.print("{d:0>2}:{d:0>2}:{d:0>2} {s} {d}", .{
-                secs_of_day / 3600,
-                (secs_of_day % 3600) / 60,
-                secs_of_day % 60,
-                offset_str.view(),
-                date.year,
-            });
-        } else {
-            row.print("{s} **Never logged in**", .{user_name});
-        }
-    } else {
-        row.print("{s} **Never logged in**", .{user_name});
-    }
-
-    const fields: Fields = .parse(row.view());
     var out: LastLogin = .{};
-    const host = fields.at(3);
+    if (raw.len != @sizeOf(LastlogRecord)) {
+        out.time_str.setTrunc("Never logged in");
+        return out;
+    }
+    // logwtmp(3) fixed this layout, so the pointer cast is the kernel
+    // ABI, not a guess.
+    const record: *const LastlogRecord = @ptrCast(@alignCast(raw.ptr));
+    if (record.ll_time == 0) {
+        out.time_str.setTrunc("Never logged in");
+        return out;
+    }
+    formatLastLoginTime(&out.time_str, record.ll_time, tz.offsetAt(record.ll_time));
+
+    const host = mem.sliceTo(&record.ll_host, 0);
     if (isDottedQuad(host)) {
         out.ip_present = true;
         out.ip.setTrunc(host);
-        var tw: Io.Writer = .fixed(out.time_str.bytes[0..]);
-        fields.join(&tw, &.{ 6, 7, 10, 8 }) catch |err| keepTruncated(err);
-        out.time_str.len = @intCast(tw.buffered().len);
-    } else {
-        var tw: Io.Writer = .fixed(out.time_str.bytes[0..]);
-        fields.join(&tw, &.{ 4, 5, 8, 6 }) catch |err| keepTruncated(err);
-        out.time_str.len = @intCast(tw.buffered().len);
-        // Dead code upstream (the join always keeps its separators, so
-        // "in**" never equals "in**   ") — kept for 1:1 fidelity.
-        if (mem.eql(u8, out.time_str.view(), "in**")) out.time_str.set("Never logged in");
     }
     return out;
 }
 
+/// "Sat Sep 26 12:06:18 -0700". The script picked its awk fields as
+/// $6, $7, $10, $8: day, time, a field that does not exist, offset. That
+/// dropped the month and year and kept the empty field's separator.
+fn formatLastLoginTime(out: *Str(64), epoch: i64, offset_seconds: i32) void {
+    const local: i64 = epoch + offset_seconds;
+    const days = @divFloor(local, 86400);
+    const secs_of_day: u64 = @intCast(@mod(local, 86400));
+    const date = civilFromDays(days);
+    var offset_str: Str(8) = .{};
+    {
+        var ow: Io.Writer = .fixed(offset_str.bytes[0..]);
+        writeTzOffset(&ow, offset_seconds) catch |err| keepTruncated(err);
+        offset_str.len = @intCast(ow.buffered().len);
+    }
+    out.print("{s} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} {s}", .{
+        weekday_names[weekdayFromDays(days)],
+        month_names[date.month - 1],
+        date.day,
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+        offset_str.view(),
+    });
+}
+
+test formatLastLoginTime {
+    // 1790449578 is the fixture record: 2026-09-26 12:06:18 -0700.
+    var out: Str(64) = .{};
+    formatLastLoginTime(&out, 1790449578, -7 * 3600);
+    try testing.expectEqualStrings("Sat Sep 26 12:06:18 -0700", out.view());
+}
+
 test "LastLogin record shape" {
     var record: LastlogRecord = undefined;
-    @memset(std.mem.asBytes(&record), 0);
+    @memset(mem.asBytes(&record), 0);
     record.ll_time = 1790449578; // the fixture: 2026-09-26 12:06:18 -0700
     @memcpy(record.ll_line[0.."pts/1".len], "pts/1");
     @memcpy(record.ll_host[0.."45.26.44.184".len], "45.26.44.184");
@@ -1705,7 +2208,7 @@ fn writeUptime(w: *Io.Writer, seconds: u64) !void {
     }
 }
 
-test "writeUptime" {
+test writeUptime {
     var buf: [32]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     try writeUptime(&w, 4 * 86400 + 23 * 3600 + 50 * 60);
@@ -1762,7 +2265,7 @@ fn currentDataLen(candidates: []const []const u8) usize {
     return @min(longest, max_data_len);
 }
 
-test "currentDataLen" {
+test currentDataLen {
     // The fixtures on the verified host: the title's 30 codepoints set
     // the column width; a host of monsters clamps at 32.
     try testing.expectEqual(@as(usize, 30), currentDataLen(&.{
@@ -1826,7 +2329,8 @@ fn writeDataRow(w: *Io.Writer, name: []const u8, data: []const u8, data_len: usi
     const data_codepoints = codepointCount(data);
     try w.writeAll("│ ");
     if (codepointCount(name) > max_name_len) {
-        try padRight(w, cutCodepoints(name, max_name_len - 3), max_name_len);
+        // cut(1) -c 10 then "...": exactly the 13-cell name column.
+        try w.writeAll(cutCodepoints(name, max_name_len - 3));
         try w.writeAll("... │ ");
     } else {
         try padRight(w, name, max_name_len);
@@ -1850,6 +2354,8 @@ const Report = struct {
     os_kernel: Str(64) = .{},
     net_hostname: Str(128) = .{},
     net_machine_ip: Str(64) = .{},
+    net_machine_extra: [max_machine_addrs]Str(64) = @splat(.{}),
+    net_machine_extra_count: u8 = 0,
     net_client_ip: Str(256) = .{},
     net_dns_ip: [max_dns_entries]Str(64) = @splat(.{}),
     net_dns_count: u8 = 0,
@@ -1859,6 +2365,7 @@ const Report = struct {
     cpu_sockets: u32 = 0,
     cpu_hypervisor: Str(32) = .{},
     cpu_freq_gh: Str(16) = .{},
+    cpu_cache: Str(24) = .{},
     load_1min_hd: u32 = 0,
     load_5min_hd: u32 = 0,
     load_15min_hd: u32 = 0,
@@ -1868,7 +2375,7 @@ const Report = struct {
     mem_percent_hd: u64 = 0,
     mem_used_gb_hd: u64 = 0,
     mem_total_gb_hd: u64 = 0,
-    disk: Disk = .{},
+    volumes: Volumes = .{},
     last_login: LastLogin = .{},
     uptime_seconds: u64 = 0,
 
@@ -1885,8 +2392,13 @@ const Report = struct {
         var hosts_buf: [etc_read_max]u8 = undefined;
         const hosts = readFileOrEmpty(io, "/etc/hosts", &hosts_buf);
         resolveHostname(&uts, hosts, &self.net_hostname);
-        gatherMachineIp(&self.net_machine_ip);
-        gatherClientIp(io, &self.net_client_ip);
+        gatherMachineIps(
+            io,
+            &self.net_machine_ip,
+            &self.net_machine_extra,
+            &self.net_machine_extra_count,
+        );
+        gatherClientIp(io, environ, &self.net_client_ip);
         gatherDnsServers(io, &self.net_dns_ip, &self.net_dns_count);
         var passwd_buf: [etc_read_max]u8 = undefined;
         const passwd = readFileOrEmpty(io, "/etc/passwd", &passwd_buf);
@@ -1906,7 +2418,9 @@ const Report = struct {
             break :blk if (raw.len > 0) trim(raw) else null;
         } else null;
         gatherCpuModel(cpuinfo, midr_str, &self.cpu_model);
-        gatherCpuFreqGh(cpuinfo, &self.cpu_freq_gh);
+        gatherCpuFreqGh(io, cpuinfo, &self.cpu_freq_gh);
+        // Only worth the sysfs walk when the clock row would be empty.
+        if (self.cpu_freq_gh.view().len == 0) gatherCpuCache(io, &self.cpu_cache);
         gatherCpuHypervisor(io, cpuinfo, &self.cpu_hypervisor);
         var present_buf: [sysfs_read_max]u8 = undefined;
         const present = readFileOrEmpty(io, "/sys/devices/system/cpu/present", &present_buf);
@@ -1929,12 +2443,12 @@ const Report = struct {
         self.mem_total_gb_hd = roundDiv(memory.total_kib * 100, 1024 * 1024);
 
         // ---- Disk Information
-        self.disk = gatherDisk(io);
+        self.volumes = gatherVolumes(io);
 
         // ---- Last login (reads $USER's record, like lastlog -u "$USER")
         const tz = readTz(io, environ);
         const uid_for_record = uidFromUserEnv(environ, passwd, uid);
-        self.last_login = gatherLastLogin(io, &tz, uid_for_record, user_name);
+        self.last_login = gatherLastLogin(io, &tz, uid_for_record);
 
         // ---- Uptime
         self.uptime_seconds = gatherUptimeSeconds(io);
@@ -1948,7 +2462,7 @@ fn parseHundredths(s: []const u8) u32 {
     return @intCast(milli / 10);
 }
 
-test "parseHundredths" {
+test parseHundredths {
     try testing.expectEqual(@as(u32, 1837), parseHundredths("18.37"));
     try testing.expectEqual(@as(u32, 0), parseHundredths(""));
 }
@@ -2005,35 +2519,30 @@ fn uidFromUserEnv(environ: process.Environ, passwd: []const u8, fallback: u32) u
     return fallback;
 }
 
+fn writeVolumeData(w: *Io.Writer, volume: *const Volume) !void {
+    const percent_hd = percentHundredths(volume.used_mib, volume.total_mib);
+    try writeHundredths(w, roundDiv(volume.used_mib * 100, 1024));
+    try w.writeAll("/");
+    try writeHundredths(w, roundDiv(volume.total_mib * 100, 1024));
+    try w.print(" GB [{d}.{d:0>2}%]", .{ percent_hd / 100, percent_hd % 100 });
+}
+
 fn writeReport(w: *Io.Writer, report: *Report) !void {
     const r = report;
 
     // The pre-graph strings that feed set_current_len, empties included:
     // bar graphs are calculated after this point upstream, so they
-    // contribute zero; the zfs- and root-volume strings both appear
-    // (one of them is built from empty variables).
-    const disk_percent_hd = percentHundredths(r.disk.used_mib, r.disk.total_mib);
-    var volume_root: Str(64) = .{};
-    {
-        var vw: Io.Writer = .fixed(volume_root.bytes[0..]);
-        try writeHundredths(&vw, roundDiv(r.disk.used_mib * 100, 1024));
-        try vw.writeAll("/");
-        try writeHundredths(&vw, roundDiv(r.disk.total_mib * 100, 1024));
-        try vw.print(" GB [{d}.{d:0>2}%]", .{ disk_percent_hd / 100, disk_percent_hd % 100 });
-        volume_root.len = @intCast(vw.buffered().len);
+    // contribute zero.
+    var volume_rows: [max_volumes]Str(64) = @splat(.{});
+    var volume_labels: [max_volumes]Str(64) = @splat(.{});
+    for (0..r.volumes.count) |i| {
+        const volume = &r.volumes.items[i];
+        volume.label(&volume_labels[i]);
+        var vw: Io.Writer = .fixed(volume_rows[i].bytes[0..]);
+        try writeVolumeData(&vw, volume);
+        volume_rows[i].len = @intCast(vw.buffered().len);
     }
-    var volume_zfs: Str(64) = .{};
-    var volume_row: Str(64) = .{};
-    if (r.disk.kind == .zfs) {
-        volume_zfs.setTrunc(volume_root.view());
-        volume_row.setTrunc(volume_root.view());
-    } else {
-        var zw: Io.Writer = .fixed(volume_zfs.bytes[0..]);
-        try zw.writeAll("/");
-        try zw.print(" GB [{d}.{d:0>2}%]", .{ disk_percent_hd / 100, disk_percent_hd % 100 });
-        volume_zfs.len = @intCast(zw.buffered().len);
-        volume_row.setTrunc(volume_root.view());
-    }
+
     var mem_row: Str(64) = .{};
     {
         var mw: Io.Writer = .fixed(mem_row.bytes[0..]);
@@ -2045,8 +2554,8 @@ fn writeReport(w: *Io.Writer, report: *Report) !void {
     }
     var cores_row: Str(64) = .{};
     cores_row.print("{d} vCPU(s) / {d} Socket(s)", .{ r.cpu_cores_per_socket, r.cpu_sockets });
-    var freq_row: Str(16) = .{};
-    freq_row.print("{s} GHz", .{r.cpu_freq_gh.view()});
+    var freq_row: Str(24) = .{};
+    if (r.cpu_freq_gh.view().len > 0) freq_row.print("{s} GHz", .{r.cpu_freq_gh.view()});
     var uptime_row: Str(32) = .{};
     {
         var uw: Io.Writer = .fixed(uptime_row.bytes[0..]);
@@ -2066,13 +2575,12 @@ fn writeReport(w: *Io.Writer, report: *Report) !void {
         cores_row.view(),
         r.cpu_hypervisor.view(),
         freq_row.view(),
+        r.cpu_cache.view(),
         "", // cpu_1min_bar_graph: unset at set_current_len time upstream
         "", // cpu_5min_bar_graph
         "", // cpu_15min_bar_graph
-        volume_zfs.view(),
         "", // disk_bar_graph
-        if (r.disk.kind == .zfs) "HEALTH O.K." else "", // zfs_health
-        volume_root.view(),
+        if (r.volumes.anyZfs()) "HEALTH O.K." else "", // zfs_health
         mem_row.view(),
         "", // mem_bar_graph
         r.last_login.time_str.view(),
@@ -2080,7 +2588,13 @@ fn writeReport(w: *Io.Writer, report: *Report) !void {
         r.last_login.ip.view(), // upstream lists it twice; harmless
         uptime_row.view(),
     };
-    const data_len = currentDataLen(&candidates);
+    var data_len = currentDataLen(&candidates);
+    for (volume_rows[0..r.volumes.count]) |row| {
+        data_len = @min(@max(data_len, codepointCount(row.view())), max_data_len);
+    }
+    for (r.net_machine_extra[0..r.net_machine_extra_count]) |extra| {
+        data_len = @min(@max(data_len, codepointCount(extra.view())), max_data_len);
+    }
 
     // ---- Machine Report (row order mirrors the script 1:1)
     try writeHeader(w, data_len);
@@ -2092,6 +2606,9 @@ fn writeReport(w: *Io.Writer, report: *Report) !void {
     try writeDivider(w, .middle, data_len);
     try writeDataRow(w, "HOSTNAME", r.net_hostname.view(), data_len);
     try writeDataRow(w, "MACHINE IP", r.net_machine_ip.view(), data_len);
+    for (r.net_machine_extra[0..r.net_machine_extra_count]) |extra| {
+        try writeDataRow(w, "", extra.view(), data_len);
+    }
     try writeDataRow(w, "CLIENT  IP", r.net_client_ip.view(), data_len);
     for (0..r.net_dns_count) |i| {
         var name_row: Str(16) = .{};
@@ -2103,19 +2620,28 @@ fn writeReport(w: *Io.Writer, report: *Report) !void {
     try writeDataRow(w, "PROCESSOR", r.cpu_model.view(), data_len);
     try writeDataRow(w, "CORES", cores_row.view(), data_len);
     try writeDataRow(w, "HYPERVISOR", r.cpu_hypervisor.view(), data_len);
-    try writeDataRow(w, "CPU FREQ", freq_row.view(), data_len);
-    try writeLoadRow(w, "LOAD  1m", r.load_1min_hd, r.cpu_cores, data_len);
-    try writeLoadRow(w, "LOAD  5m", r.load_5min_hd, r.cpu_cores, data_len);
-    try writeLoadRow(w, "LOAD 15m", r.load_15min_hd, r.cpu_cores, data_len);
+    // A clock row with no clock rendered " GHz". When no frequency source
+    // exists, the last-level cache is the hardware fact worth the slot.
+    if (freq_row.view().len > 0) {
+        try writeDataRow(w, "CPU FREQ", freq_row.view(), data_len);
+    } else if (r.cpu_cache.view().len > 0) {
+        try writeDataRow(w, "CPU CACHE", r.cpu_cache.view(), data_len);
+    }
+    try writeBarRow(w, "LOAD  1m", r.load_1min_hd, @as(u64, r.cpu_cores) * 100, data_len);
+    try writeBarRow(w, "LOAD  5m", r.load_5min_hd, @as(u64, r.cpu_cores) * 100, data_len);
+    try writeBarRow(w, "LOAD 15m", r.load_15min_hd, @as(u64, r.cpu_cores) * 100, data_len);
     try writeDivider(w, .middle, data_len);
-    try writeDataRow(w, "VOLUME", volume_row.view(), data_len);
-    try writeDiskBar(w, r.disk, data_len);
-    if (r.disk.kind == .zfs) {
+    for (0..r.volumes.count) |i| {
+        const volume = &r.volumes.items[i];
+        try writeDataRow(w, volume_labels[i].view(), volume_rows[i].view(), data_len);
+        try writeBarRow(w, "DISK USAGE", volume.used_mib, volume.total_mib, data_len);
+    }
+    if (r.volumes.anyZfs()) {
         try writeDataRow(w, "ZFS HEALTH", "HEALTH O.K.", data_len);
     }
     try writeDivider(w, .middle, data_len);
     try writeDataRow(w, "MEMORY", mem_row.view(), data_len);
-    try writeMemBar(w, r, data_len);
+    try writeBarRow(w, "USAGE", @abs(r.mem_used_kib), r.mem_total_kib, data_len);
     try writeDivider(w, .middle, data_len);
     try writeDataRow(w, "LAST LOGIN", r.last_login.time_str.view(), data_len);
     if (r.last_login.ip_present) {
@@ -2125,47 +2651,31 @@ fn writeReport(w: *Io.Writer, report: *Report) !void {
     try writeDivider(w, .bottom, data_len);
 }
 
-fn writeLoadRow(w: *Io.Writer, name: []const u8, load_hd: u32, cores: u32, data_len: usize) !void {
+/// A data row carrying a bar graph: the script's bar_graph(used, total)
+/// into the data column.
+fn writeBarRow(w: *Io.Writer, name: []const u8, used: u64, total: u64, data_len: usize) !void {
     var bar: Str(1024) = .{};
     var bw: Io.Writer = .fixed(bar.bytes[0..]);
-    try writeBar(&bw, load_hd, @as(u64, cores) * 100, data_len);
+    try writeBar(&bw, used, total, data_len);
     bar.len = @intCast(bw.buffered().len);
     try writeDataRow(w, name, bar.view(), data_len);
 }
 
-fn writeDiskBar(w: *Io.Writer, disk: Disk, data_len: usize) !void {
-    var bar: Str(1024) = .{};
-    var bw: Io.Writer = .fixed(bar.bytes[0..]);
-    try writeBar(&bw, disk.used_mib, disk.total_mib, data_len);
-    bar.len = @intCast(bw.buffered().len);
-    try writeDataRow(w, "DISK USAGE", bar.view(), data_len);
-}
-
-fn writeMemBar(w: *Io.Writer, r: *Report, data_len: usize) !void {
-    var bar: Str(1024) = .{};
-    var bw: Io.Writer = .fixed(bar.bytes[0..]);
-    try writeBar(&bw, @abs(r.mem_used_kib), r.mem_total_kib, data_len);
-    bar.len = @intCast(bw.buffered().len);
-    try writeDataRow(w, "USAGE", bar.view(), data_len);
-}
-
 pub fn main(init: process.Init.Minimal) !void {
-    const gpa = if (use_debug_allocator)
-        debug_allocator.allocator()
+    const gpa = if (use_safe_allocator)
+        safe_allocator.allocator()
     else
         heap.page_allocator;
 
-    defer if (use_debug_allocator) {
-        _ = debug_allocator.deinit();
+    defer if (use_safe_allocator) {
+        _ = safe_allocator.deinit();
     };
 
     var arena_allocator: heap.ArenaAllocator = .init(gpa);
     defer arena_allocator.deinit();
-    // The report itself is fully static (bounded buffers everywhere, no
-    // allocation by design); the arena stays for anything dynamic later.
-    _ = arena_allocator.allocator();
+    const arena = arena_allocator.allocator();
 
-    var threaded: Io.Threaded = .init(gpa, .{
+    var threaded: Io.Threaded = .init(arena, .{
         .argv0 = .init(.{ .vector = init.args.vector }),
         .environ = init.environ,
     });
@@ -2177,8 +2687,11 @@ pub fn main(init: process.Init.Minimal) !void {
     var stdout_buffer: [stdout_buffer_len]u8 = undefined;
     var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const w = &stdout_writer.interface;
-    try writeReport(w, &report);
-    try w.flush();
+    // A reader that leaves early (report | head) or a full disk is not a
+    // crash: there is nowhere left to print, so stop quietly. Propagating
+    // WriteFailed panicked with a stack trace and could abort.
+    writeReport(w, &report) catch return;
+    w.flush() catch return;
 }
 
 test "row geometry against golden shape" {

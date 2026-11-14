@@ -16,21 +16,6 @@ test:
 lint:
     zig fmt --check src/main.zig && ziglint src/main.zig
 
-# Byte-for-byte comparison against the bash reference; volatile rows aside.
-# The raw diff should show only load/memory/disk/uptime rows, the
-# normalized diff should be empty.
-golden: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    bash machine_report.sh > /tmp/tr100_bash.txt 2>/dev/null
-    ./zig-out/bin/usgc_machine_report > /tmp/tr100_zig.txt
-    # Informational: volatile rows (load, memory, disk, uptime) drift
-    # between the two runs; the normalized diff is the actual gate.
-    diff /tmp/tr100_bash.txt /tmp/tr100_zig.txt || true
-    diff <(sed 's/[0-9]/N/g' /tmp/tr100_bash.txt) \
-         <(sed 's/[0-9]/N/g' /tmp/tr100_zig.txt) \
-        && echo "normalized diff: identical"
-
 # Bench the bash script against the port.
 bench: build-release
     hyperfine -N --warmup 10 --runs 50 \
@@ -50,5 +35,9 @@ bump-deps:
 run:
     zig build run
 
-# Default: verify everything that can be verified.
-default: test lint golden
+# The bash reference is no longer a byte-for-byte target: OS, CPU, volume
+# and last-login rows deliberately report more than machine_report.sh did.
+# `zig build test` holds the frame geometry.
+
+[doc('Run the test suite and lint.')]
+default: test lint

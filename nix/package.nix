@@ -17,7 +17,7 @@ let
     version = "0.0.0";
     src = source;
     strictDeps = true;
-    nativeBuildInputs = [ pkgs.zig_0_16.hook ];
+    nativeBuildInputs = [ pkgs.zig_0_17.hook ];
     dontSetZigDefaultFlags = true;
     zigBuildFlags = [
       "-Doptimize=ReleaseFast"
@@ -37,7 +37,7 @@ let
       runHook postInstallCheck
     '';
     meta = {
-      description = "TR-100 machine report — fork-free login banner";
+      description = "TR-100 machine report";
       homepage = "https://github.com/mattrobenolt/usgc-machine-report";
       license = lib.licenses.bsd3;
       mainProgram = "usgc_machine_report";
